@@ -116,6 +116,7 @@ export const { use: useSessionTabs, provider: SessionTabsProvider } = createSimp
     }
 
     const root = (sessionID: string) => data.session.root(sessionID)
+    const current = () => (route.data.type === "session" ? root(route.data.sessionID) : undefined)
     const title = (sessionID: string, persisted?: string, fallback?: string) => {
       const session = data.session.get(sessionID)
       return session?.title ?? persisted ?? fallback ?? (session ? withTimestampedFallback(session) : undefined)
@@ -132,11 +133,14 @@ export const { use: useSessionTabs, provider: SessionTabsProvider } = createSimp
     const normalize = (value: TabsState) => ({
       tabs: value.tabs.reduce<SessionTab[]>((tabs, tab) => {
         const sessionID = root(tab.sessionID)
+        // Archiving closes a tab, so a session archived while this client was closed must not
+        // return through persisted tab state. Keep the routed session so opening an archived
+        // transcript still shows a tab while the user is reading it.
+        if (data.session.get(sessionID)?.time.archived !== undefined && sessionID !== current()) return tabs
         return openSessionTab(tabs, { sessionID, title: title(sessionID, tab.title) })
       }, []),
       unread: {},
     })
-    const current = () => (route.data.type === "session" ? root(route.data.sessionID) : undefined)
     createSessionRetention({
       session: data.session,
       current: () =>
@@ -336,6 +340,18 @@ export const { use: useSessionTabs, provider: SessionTabsProvider } = createSimp
         const sessionID = root(evt.data.sessionID)
         if (current() === sessionID || !state().tabs.some((tab) => tab.sessionID === sessionID)) return
         setPromptPulses((pulses) => ({ ...pulses, [sessionID]: (pulses[sessionID] ?? 0) + 1 }))
+      }),
+    )
+    onCleanup(
+      event.on("session.archived", (evt) => {
+        if (!enabled()) return
+        const sessionID = evt.data.sessionID
+        // Tabs belong to root sessions. Archiving a subagent must not close its parent's tab.
+        if (root(sessionID) !== sessionID) return
+        // Archiving is the supported way to retire a retained session from the session lists.
+        // Close its tab too, without deleting the transcript, and drop any reopen entry.
+        setClosedTabs((entries) => entries.filter((entry) => entry.tab.sessionID !== sessionID))
+        remove(sessionID, true)
       }),
     )
     onCleanup(

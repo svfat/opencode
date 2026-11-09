@@ -36,13 +36,14 @@ async function renderSessionTabs(
     sessionGate?: Promise<void>
     sessionDirectories?: Record<string, string>
     sessionParents?: Record<string, string>
-    sessionTimes?: Record<string, { idle?: number; viewed?: number }>
+    sessionTimes?: Record<string, { idle?: number; viewed?: number; archived?: number }>
     sessionOutcomes?: Record<string, "succeeded" | "failed" | "interrupted">
     newLocation?: "launch" | "inherit"
     launchDirectory?: string
     tabsEnabled?: boolean
     viewFailures?: number
     experimental?: Record<string, boolean>
+    events?: ReturnType<typeof createEventStream>
   },
 ) {
   const temporary = options?.state ? undefined : await tmpdir()
@@ -63,8 +64,9 @@ async function renderSessionTabs(
       }),
     )
   }
-  const events = createEventStream()
+  const events = options?.events ?? createEventStream()
   const sessions: string[] = []
+  const deletions: string[] = []
   const views: string[] = []
   const viewWatermarks: number[] = []
   const locations: string[] = []
@@ -109,6 +111,10 @@ async function renderSessionTabs(
       return new Response(null, { status: 204 })
     }
     const sessionID = url.pathname.match(/^\/api\/session\/([^/]+)$/)?.[1]
+    if (sessionID && request.method === "DELETE") {
+      deletions.push(sessionID)
+      return new Response(null, { status: 204 })
+    }
     if (!sessionID) return undefined
     sessions.push(sessionID)
     await options?.sessionGate
@@ -190,6 +196,7 @@ async function renderSessionTabs(
     route,
     data,
     sessions,
+    deletions,
     views,
     viewWatermarks,
     locations,
@@ -348,6 +355,145 @@ test("lists closed tabs newest first and reopens a selected entry", async () => 
     await wait(() => setup.tabs.tabs().length === 3)
     expect(setup.tabs.current()).toBe("third")
     expect(setup.tabs.recentlyClosed()).toEqual([])
+  } finally {
+    await setup.destroy()
+  }
+})
+
+test("closes the tab of an archived session without deleting the session", async () => {
+  const setup = await renderSessionTabs("first", { persisted: ["first", "second", "third"] })
+  try {
+    await wait(() => setup.tabs.tabs().length === 3)
+    setup.emit({
+      id: "evt_archived_second",
+      created: 5,
+      type: "session.archived",
+      durable: { aggregateID: "second", seq: 1, version: 1 },
+      data: { sessionID: "second" },
+    })
+    await wait(() => !setup.tabs.tabs().some((tab) => tab.sessionID === "second"))
+
+    expect(setup.tabs.tabs().map((tab) => tab.sessionID)).toEqual(["first", "third"])
+    expect(setup.tabs.current()).toBe("first")
+    expect(setup.deletions).toEqual([])
+  } finally {
+    await setup.destroy()
+  }
+})
+
+test("archiving the active session selects another tab instead of leaving a blank route", async () => {
+  const setup = await renderSessionTabs("second", { persisted: ["first", "second", "third"] })
+  try {
+    await wait(() => setup.tabs.current() === "second" && setup.tabs.tabs().length === 3)
+    setup.emit({
+      id: "evt_archived_active",
+      created: 5,
+      type: "session.archived",
+      durable: { aggregateID: "second", seq: 1, version: 1 },
+      data: { sessionID: "second" },
+    })
+    await wait(() => setup.tabs.current() === "third")
+
+    expect(setup.tabs.tabs().map((tab) => tab.sessionID)).toEqual(["first", "third"])
+    expect(setup.route.data).toEqual({ type: "session", sessionID: "third" })
+  } finally {
+    await setup.destroy()
+  }
+})
+
+test("does not restore a persisted tab for a session archived while the client was closed", async () => {
+  const setup = await renderSessionTabs("first", {
+    persisted: ["first", "archived"],
+    sessionTimes: { archived: { archived: 1 } },
+  })
+  try {
+    await wait(() => setup.data.session.get("archived")?.time.archived !== undefined)
+    await wait(() => setup.tabs.tabs().every((tab) => tab.sessionID !== "archived"))
+
+    expect(setup.tabs.tabs().map((tab) => tab.sessionID)).toEqual(["first"])
+  } finally {
+    await setup.destroy()
+  }
+})
+
+test("archiving a subagent does not close its parent tab", async () => {
+  const setup = await renderSessionTabs("root", {
+    persisted: ["root", "other"],
+    sessionParents: { child: "root" },
+  })
+  try {
+    await wait(() => setup.data.session.get("child") !== undefined)
+    await wait(() => setup.tabs.tabs().length === 2)
+    setup.emit({
+      id: "evt_archived_child",
+      created: 5,
+      type: "session.archived",
+      durable: { aggregateID: "child", seq: 1, version: 1 },
+      data: { sessionID: "child" },
+    })
+    await Bun.sleep(20)
+
+    expect(setup.tabs.tabs().map((tab) => tab.sessionID)).toEqual(["root", "other"])
+    expect(setup.tabs.current()).toBe("root")
+    expect(setup.deletions).toEqual([])
+  } finally {
+    await setup.destroy()
+  }
+})
+
+test("archiving closes the tab in another TUI sharing the same tab state", async () => {
+  await using temporary = await tmpdir()
+  const events = createEventStream()
+  const clients: Awaited<ReturnType<typeof renderSessionTabs>>[] = []
+
+  try {
+    const first = await renderSessionTabs("shared", { state: temporary.path, events })
+    clients.push(first)
+    const second = await renderSessionTabs("shared", { state: temporary.path, events })
+    clients.push(second)
+    await wait(() => first.tabs.tabs().some((tab) => tab.sessionID === "shared"), 2_000, "first tab to open")
+    await wait(() => second.tabs.tabs().some((tab) => tab.sessionID === "shared"), 2_000, "second tab to open")
+    await Promise.all([first.flush(), second.flush()])
+
+    first.emit({
+      id: "evt_archived_shared",
+      created: 5,
+      type: "session.archived",
+      durable: { aggregateID: "shared", seq: 1, version: 1 },
+      data: { sessionID: "shared" },
+    })
+    await wait(
+      () => !first.tabs.tabs().some((tab) => tab.sessionID === "shared"),
+      2_000,
+      "first client to close the archived tab",
+    )
+    await wait(
+      () => !second.tabs.tabs().some((tab) => tab.sessionID === "shared"),
+      2_000,
+      "second client to close the archived tab",
+    )
+
+    expect(first.tabs.tabs()).toEqual([])
+    expect(second.tabs.tabs()).toEqual([])
+  } finally {
+    await Promise.allSettled(clients.map((client) => client.destroy()))
+  }
+})
+
+test("keeps the tab of an archived session open while it is the routed session", async () => {
+  const setup = await renderSessionTabs("archived", {
+    persisted: ["archived", "first"],
+    sessionTimes: { archived: { archived: 1 } },
+  })
+  try {
+    await wait(() => setup.data.session.get("archived")?.time.archived !== undefined)
+    await Bun.sleep(20)
+    expect(setup.tabs.tabs().map((tab) => tab.sessionID)).toEqual(["archived", "first"])
+
+    setup.route.navigate({ type: "session", sessionID: "first" })
+    await wait(() => setup.tabs.tabs().every((tab) => tab.sessionID !== "archived"))
+
+    expect(setup.tabs.tabs().map((tab) => tab.sessionID)).toEqual(["first"])
   } finally {
     await setup.destroy()
   }
